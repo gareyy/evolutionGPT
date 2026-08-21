@@ -27,5 +27,11 @@ class Population:
             self.population.append(model)
 
     def compile(self):
-        for i in range(len(self.population)):
-            self.population[i] = torch.compile(self.population[i], dynamic=False)
+        for model in self.population:
+            model = torch.compile(model, dynamic=False)
+
+    def breed(self):
+        #self.population[2].cross_over(self.population[0], self.population[1])
+        print(hash(str(self.population[0])))
+        self.population[0].mutate()
+        print(hash(str(self.population[0])))

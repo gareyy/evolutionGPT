@@ -45,6 +45,8 @@ parser.add_argument("--num-iterations", type=int, default=-1, help="explicit num
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
 parser.add_argument("--target-param-data-ratio", type=float, default=12, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
 # Evolution
+parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
+parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
 parser.add_argument("--num-next-gen", type=int, default=5, help="number of models that will advance to the next generation")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
@@ -121,6 +123,7 @@ def get_config(depth):
 config = get_config(args.depth)
 population = Population(args.num_next_gen, config, device)
 population.fill_with_random()
+
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
@@ -225,6 +228,8 @@ def disable_fp8(model):
 orig_model = population.population[0] # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
 population.compile() # the inputs to model will never change shape so dynamic=False is safe
 
+population.breed()
+exit(0)
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
 
@@ -250,7 +255,9 @@ num_scaling_params = get_scaling_params(first_model)
 target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
 
 # Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
-d12_ref = build_model_meta(12) # creates the model on meta device
+d12_config = get_config(12)
+with torch.device("meta"):
+    d12_ref = GPT(d12_config) # creates the model on meta device
 D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref) # compute-optimal d12 training horizon in tokens (measured empirically)
 B_REF = 2**19 # optimal batch size at d12 ~= 524,288 tokens (measured empirically)
 
@@ -339,6 +346,7 @@ print0(f"Total number of training tokens: {total_tokens:,}")
 print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
+"""
 # Learning rate schedule (linear warmup, constant, linear warmdown)
 def get_lr_multiplier(it):
     warmup_iters = args.warmup_steps
@@ -367,17 +375,20 @@ def get_muon_momentum(it):
 # Weight decay scheduler for Muon optimizer (cosine decay to zero over the course of training)
 def get_weight_decay(it):
     return weight_decay_scaled * 0.5 * (1 + math.cos(math.pi * it / num_iterations))
+"""
 
 # -----------------------------------------------------------------------------
 # Training loop
 
 # Loop state (variables updated by the training loop)
+"""
 if not resuming:
     step = 0
     val_bpb = None # will be set if eval_every > 0
     min_val_bpb = float("inf")
     smooth_train_loss = 0 # EMA of training loss
     total_training_time = 0 # total wall-clock time of training
+
 else:
     step = meta_data["step"]
     loop_state = meta_data["loop_state"]
@@ -385,6 +396,12 @@ else:
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
+"""
+step = 0
+val_bpb = None # will be set if eval_every > 0
+min_val_bpb = float("inf")
+smooth_train_loss = 0 # EMA of training loss
+total_training_time = 0 # total wall-clock time of training
 
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank

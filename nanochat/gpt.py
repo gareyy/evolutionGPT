@@ -12,6 +12,7 @@ Notable features:
 - Flash Attention 3 integration
 """
 
+from __future__ import annotations
 from functools import partial
 from dataclasses import dataclass
 
@@ -37,6 +38,8 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    mutation_rate: float = 0.001
+    mutation_stdev: float = 0.1
 
 
 def norm(x):
@@ -154,7 +157,7 @@ class Block(nn.Module):
 
 
 class GPT(nn.Module):
-    def __init__(self, config, pad_vocab_size_to=64):
+    def __init__(self, config: GPTConfig, pad_vocab_size_to=64):
         """
         NOTE a major footgun: this __init__ function runs in meta device context (!!)
         Therefore, any calculations inside here are shapes and dtypes only, no actual data.
@@ -553,3 +556,15 @@ class GPT(nn.Module):
             ids = torch.cat((ids, next_ids), dim=1)
             token = next_ids.item()
             yield token
+    
+    def cross_over(self, modelA: GPT, modelB: GPT):
+        modelAparams = list(modelA.parameters())
+        modelBparams = list(modelB.parameters())
+        for i, param in enumerate(self.parameters()):
+            print(i, param)
+            print(modelAparams[i])
+            
+    def mutate(self):
+        for param in self.parameters():
+            if torch.rand(1).item() < self.config.mutation_rate:
+                param.data += torch.randn_like(param) * self.config.mutation_stdev

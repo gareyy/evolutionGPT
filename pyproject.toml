@@ -24,8 +24,8 @@ dev = [
     "python-dotenv>=1.2.1",
 ]
 
-[tool.setuptools.packages.find]
-where = ["./"]
+#[tool.setuptools.packages.find]
+#where = ["./"]
 
 [tool.pytest.ini_options]
 markers = [
