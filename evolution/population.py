@@ -14,7 +14,7 @@ class Population:
     def __init__(self, num_strongest, gptconfig: GPTConfig, device) -> None:
         self.num_strongest = num_strongest
         self.pop_cap = self.num_strongest**2
-        self.population = []
+        self.population: list[GPT] = []
         self.gptconfig = gptconfig
         self.device = device
         for _ in range(self.num_strongest):
@@ -36,3 +36,23 @@ class Population:
             model = self.population[i+self.num_strongest]
             model.cross_over(self.population[p[0]], self.population[p[1]])
             model.mutate()
+
+    def train(self):
+        for model in self.population:
+            model.train()
+
+    def eval(self):
+        for model in self.population:
+            model.eval()
+
+    def loss(self, x, y) -> list[float]:
+        losses = []
+        for model in self.population:
+            loss = model(x, y)
+            loss = loss.detach()
+            losses.append(loss)
+        return losses
+
+    def sort_to_fittest(self, losses: list[float]):
+        modeltoloss = dict(zip(self.population, losses))
+        self.population.sort(key=lambda m: modeltoloss[m])
