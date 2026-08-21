@@ -1,6 +1,17 @@
-import os
+"""
+Train model. From root directory of the project, run as:
 
-from evolution.population import Population
+python -m scripts.base_train
+
+or distributed as:
+
+torchrun --nproc_per_node=8 -m scripts.base_train
+
+If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
+python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --core-metric-every=-1 --total-batch-size=512 --num-iterations=20
+"""
+
+import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import gc
 import json
@@ -23,6 +34,7 @@ from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
+print_banner()
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -35,17 +47,27 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
 # Model architecture
-parser.add_argument("--depth", type=int, default=5, help="depth of the Transformer model")
+parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
-parser.add_argument("--max-seq-len", type=int, default=1024, help="max context length")
+parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
 parser.add_argument("--target-param-data-ratio", type=float, default=12, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
-# Evolution
-parser.add_argument("--num-next-gen", type=int, default=5, help="number of models that will advance to the next generation")
+# Optimization
+parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
+parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
+parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
+parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learning rate for unembedding parameters (Adam)")
+parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
+parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
+parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
+parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
+parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
+parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
+parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
@@ -100,14 +122,14 @@ tokenizer = get_tokenizer()
 token_bytes = get_token_bytes(device=device)
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
-vocab_size = 32768
 
 # -----------------------------------------------------------------------------
 # Initialize the Model
-def get_config(depth):
+
+def build_model_meta(depth):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
     # Model dim is nudged up to nearest multiple of head_dim for clean division
-    # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == head_dim exactly)
+    # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
@@ -116,16 +138,20 @@ def get_config(depth):
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
     )
-    return config
+    with torch.device("meta"):
+        model_meta = GPT(config)
+    return model_meta
 
-config = get_config(args.depth)
-population = Population(args.num_next_gen, config, device)
-population.fill_with_random()
+# Build the model, move to device, init the weights
+model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtypes, no data)
+model_config = model.config
+model_config_kwargs = asdict(model_config)
+print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
+model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
+model.init_weights() # 3) All tensors get initialized
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
-#  TODO: work on later
-"""
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
@@ -134,8 +160,6 @@ if resuming:
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
-"""
-resuming = False
 
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
@@ -161,15 +185,11 @@ if args.fp8:
             return True
 
         fp8_config = Float8LinearConfig.from_recipe_name(args.fp8_recipe)
-        isprinted = False
-        for model in population.population:
-            num_linear = sum(1 for m in model.modules() if isinstance(m, nn.Linear))
-            convert_to_float8_training(model, config=fp8_config, module_filter_fn=fp8_module_filter)
-            num_fp8 = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
-            num_skipped = num_linear - num_fp8
-            if not isprinted:
-                print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8}/{num_linear} linear layers, skipped {num_skipped} (too small)")
-                isprinted = True
+        num_linear = sum(1 for m in model.modules() if isinstance(m, nn.Linear))
+        convert_to_float8_training(model, config=fp8_config, module_filter_fn=fp8_module_filter)
+        num_fp8 = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
+        num_skipped = num_linear - num_fp8
+        print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8}/{num_linear} linear layers, skipped {num_skipped} (too small)")
 
 # Context manager to temporarily disable FP8 so that model evaluation remains in BF16
 @contextmanager
@@ -222,20 +242,19 @@ def disable_fp8(model):
 # -----------------------------------------------------------------------------
 # Compile the model
 
-orig_model = population.population[0] # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-population.compile() # the inputs to model will never change shape so dynamic=False is safe
+orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
+model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
 
 # Get the parameter counts of our model
-first_model = population.population[0]
-param_counts = first_model.num_scaling_params()
+param_counts = model.num_scaling_params()
 print0(f"Parameter counts:")
 for key, value in param_counts.items():
     print0(f"{key:24s}: {value:,}")
 num_params = param_counts['total']
-num_flops_per_token = first_model.estimate_flops()
+num_flops_per_token = model.estimate_flops()
 print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
 # 1) Use scaling laws to determine the optimal training horizon in tokens
@@ -246,7 +265,7 @@ def get_scaling_params(m):
     params_counts = m.num_scaling_params()
     scaling_params = params_counts['transformer_matrices'] + params_counts['lm_head']
     return scaling_params
-num_scaling_params = get_scaling_params(first_model)
+num_scaling_params = get_scaling_params(model)
 target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
 
 # Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
@@ -264,7 +283,6 @@ if total_batch_size == -1:
     total_batch_size = 2 ** round(math.log2(predicted_batch_size)) # clamp to nearest power of 2 for efficiency
     print0(f"Auto-computed optimal batch size: {total_batch_size:,} tokens")
 
-"""
 # 3) Knowing the batch size, we can now calculate a learning rate correction (bigger batch size allows higher learning rates)
 batch_lr_scale = 1.0
 batch_ratio = total_batch_size / B_REF # B/B_ref
@@ -300,7 +318,7 @@ optimizer = model.setup_optimizer(
 if resuming:
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
-"""
+
 # -----------------------------------------------------------------------------
 # GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)
 scaler = torch.amp.GradScaler() if COMPUTE_DTYPE == torch.float16 else None
@@ -309,8 +327,7 @@ if scaler is not None:
 
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
-#dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-dataloader_resume_state_dict = None
+dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
 train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
@@ -457,7 +474,6 @@ while True:
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
-    """
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
         save_checkpoint(
             checkpoint_dir,
@@ -481,7 +497,6 @@ while True:
             },
             rank=ddp_rank,
         )
-    """
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step:
@@ -578,7 +593,7 @@ while True:
     elif step % 5000 == 0: # every 5000 steps...
         gc.collect() # manually collect, just to be safe for very, very long runs
 
-# print0 a few more stats
+# print a few more stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 if val_bpb is not None:

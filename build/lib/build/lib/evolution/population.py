@@ -25,7 +25,3 @@ class Population:
         for _ in range(self.pop_cap - self.num_strongest):
             model = initialise_model(self.gptconfig, self.device)
             self.population.append(model)
-
-    def compile(self):
-        for i in range(len(self.population)):
-            self.population[i] = torch.compile(self.population[i], dynamic=False)
