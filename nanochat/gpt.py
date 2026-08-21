@@ -558,13 +558,24 @@ class GPT(nn.Module):
             yield token
     
     def cross_over(self, modelA: GPT, modelB: GPT):
-        modelAparams = list(modelA.parameters())
-        modelBparams = list(modelB.parameters())
-        for i, param in enumerate(self.parameters()):
-            print(i, param)
-            print(modelAparams[i])
+        modelAparams = modelA.state_dict()
+        modelBparams = modelB.state_dict()
+        with torch.no_grad():
+            for name, param in self.state_dict().items():
+                if (len(param.shape) == 1):
+                    for j in range(len(param)):
+                        if torch.rand(1).item() < 0.5:
+                            param[j] = modelAparams[name][j]
+                        else:
+                            param[j] = modelBparams[name][j]             
+                else:
+                    midway = len(param) // 2
+                    param[:midway] = modelAparams[name][:midway]
+                    param[midway:] = modelBparams[name][midway:]
             
     def mutate(self):
-        for param in self.parameters():
-            if torch.rand(1).item() < self.config.mutation_rate:
-                param.data += torch.randn_like(param) * self.config.mutation_stdev
+        for name, param in self.state_dict().items():
+            if not "weight" in name:
+                continue
+            if torch.rand(1).item() < self.config.mutation_rate or True:
+                param += torch.randn_like(param) * self.config.mutation_stdev

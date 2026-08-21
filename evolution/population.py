@@ -1,5 +1,6 @@
 import torch
 from nanochat.gpt import GPTConfig, GPT
+from itertools import permutations
 
 def initialise_model(config: GPTConfig, device):
     # Build the model, move to device, init the weights
@@ -31,7 +32,7 @@ class Population:
             model = torch.compile(model, dynamic=False)
 
     def breed(self):
-        #self.population[2].cross_over(self.population[0], self.population[1])
-        print(hash(str(self.population[0])))
-        self.population[0].mutate()
-        print(hash(str(self.population[0])))
+        for i, p in enumerate(permutations(range(self.num_strongest), 2)):
+            model = self.population[i+self.num_strongest]
+            model.cross_over(self.population[p[0]], self.population[p[1]])
+            model.mutate()
