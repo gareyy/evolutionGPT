@@ -564,10 +564,11 @@ class GPT(nn.Module):
             for name, param in self.state_dict().items():
                 if not "weight" in name:
                     continue
-                if torch.rand(1).item() < 0.5:
-                    param = modelAparams[name].detach().clone()
-                else:
-                    param = modelBparams[name].detach().clone()
+                #if torch.rand(1).item() < 0.5:
+                #    param = modelAparams[name].detach().clone()
+                #else:
+                #    param = modelBparams[name].detach().clone()
+                param = (modelAparams[name] + modelBparams[name]) // 2
 
             
     def mutate(self, mutation_rate: float | None = None):

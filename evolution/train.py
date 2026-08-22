@@ -46,9 +46,9 @@ parser.add_argument("--num-iterations", type=int, default=-1, help="explicit num
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
 parser.add_argument("--target-param-data-ratio", type=float, default=12, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
 # Evolution
-parser.add_argument("--num-next-gen", type=int, default=3, help="number of models that will advance to the next generation")
+parser.add_argument("--num-next-gen", type=int, default=4, help="number of models that will advance to the next generation")
 # Optimization
-parser.add_argument("--device-batch-size", type=int, default=8, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
+parser.add_argument("--device-batch-size", type=int, default=4, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learning rate for unembedding parameters (Adam)")
@@ -521,7 +521,8 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
-    train_loss = 100.0
+    train_loss = 67.0
+    losses = [train_loss for _ in population.population]
     for micro_step in tqdm(range(grad_accum_steps)):
         losses = []
         for model in population.population:
@@ -533,11 +534,13 @@ while True:
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
-        population.sort_to_fittest(losses)
-        population.breed()
         train_loss = min(losses) # for logging
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-    print0(f"Hash of best model: {hash(tuple(population.population[0].parameters()))}")
+    print0(f"Hashes of top {args.num_next_gen} models: {[hash(model) for model in population.population[:args.num_next_gen]]}")
+    population.sort_to_fittest(losses)
+    population.breed()
+    sortedlosses = sorted(losses)
+    print0(f"Loss of child nodes: {sortedlosses[args.num_next_gen]}")
 
     # step the optimizer
     lrm = get_lr_multiplier(step)
@@ -608,12 +611,14 @@ while True:
     # The garbage collector is sadly a little bit overactive and for some poorly understood reason,
     # it spends ~500ms scanning for cycles quite frequently, just to end up cleaning up very few tiny objects each time.
     # So we manually manage and help it out here
+    """
     if first_step_of_run:
         gc.collect() # manually collect a lot of garbage from setup
         gc.freeze() # immediately freeze all currently surviving objects and exclude them from GC
         gc.disable() # nuclear intervention here: disable GC entirely except:
     elif step % 5000 == 0: # every 5000 steps...
         gc.collect() # manually collect, just to be safe for very, very long runs
+    """
 
 # print0 a few more stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
