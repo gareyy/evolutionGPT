@@ -23,6 +23,7 @@ from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
+from tqdm import tqdm
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -35,7 +36,7 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
 # Model architecture
-parser.add_argument("--depth", type=int, default=5, help="depth of the Transformer model")
+parser.add_argument("--depth", type=int, default=6, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=32, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=64, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=512, help="max context length")
@@ -102,7 +103,6 @@ tokenizer = get_tokenizer()
 token_bytes = get_token_bytes(device=device)
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
-vocab_size = 32768
 
 # -----------------------------------------------------------------------------
 # Initialize the Model
@@ -320,11 +320,6 @@ train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokeniz
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
-losses = population.loss(x, y)
-population.sort_to_fittest(losses)
-
-print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
-exit(0)
 # -----------------------------------------------------------------------------
 # Calculate the number of iterations we will train for and set up the various schedulers
 
@@ -384,6 +379,7 @@ def get_weight_decay(it):
 # Training loop
 
 # Loop state (variables updated by the training loop)
+# TODO
 """
 if not resuming:
     step = 0
@@ -420,7 +416,8 @@ while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
 
-    # once in a while: evaluate the val bpb (all ranks participate)
+    # once in a while: evaluate the val bpb on the best model (all ranks participate)
+    """
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
         model.eval()
         val_loader = build_val_loader()
@@ -437,7 +434,9 @@ while True:
             "val/bpb": val_bpb,
         })
         model.train()
+    """
 
+    """
     # once in a while: estimate the CORE metric (all ranks participate)
     # use the original uncompiled model because the inputs keep changing shape
     # disable FP8 for evaluation to use BF16 for more consistent/accurate results
@@ -454,10 +453,12 @@ while True:
             "centered_results": results["centered_results"],
         })
         model.train()
+    """
 
-    # once in a while: sample from the model (only on master process)
+    # once in a while: sample from the best model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
     if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
+        model = population.population[0]
         model.eval()
         prompts = [
             "The capital of France is",
@@ -512,15 +513,22 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    train_loss = 100.0
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
-        train_loss = loss.detach() # for logging
+        losses = population.loss(x, y)
+        train_loss = min(losses) # for logging
+        population.sort_to_fittest(losses)
+        population.breed()
+        """
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
+        """
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+    """
+
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -543,7 +551,7 @@ while True:
     else:
         optimizer.step()
     model.zero_grad(set_to_none=True)
-    train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
+    """
     synchronize()
     t1 = time.time()
     dt = t1 - t0
@@ -551,7 +559,7 @@ while True:
 
     # logging (CPU action only)
     ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
+    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(total_batch_size / dt)
@@ -569,14 +577,14 @@ while True:
     else:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    print0(f"Hash of best model: {hash(population.population[0])}")
     if step % 100 == 0:
         log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "train/loss": debiased_smooth_loss,
-            "train/lrm": lrm,
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
