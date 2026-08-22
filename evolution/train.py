@@ -1,4 +1,5 @@
 import os
+from os.path import isdir, isfile
 
 from torch.autograd import grad
 
@@ -12,6 +13,7 @@ import math
 import argparse
 from dataclasses import asdict
 from contextlib import contextmanager
+from shutil import rmtree
 
 import wandb
 import torch
@@ -421,8 +423,6 @@ while True:
     flops_so_far = num_flops_per_token * total_batch_size * step
 
     # once in a while: evaluate the val bpb on the best model (all ranks participate)
-    """
-
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
         population.eval()
         val_loader = build_val_loader()
@@ -441,14 +441,16 @@ while True:
         })
         population.train()
 
+    """
     # once in a while: estimate the CORE metric (all ranks participate)
     # use the original uncompiled model because the inputs keep changing shape
     # disable FP8 for evaluation to use BF16 for more consistent/accurate results
     results = {}
     if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
         population.eval()
-        with disable_fp8(orig_model):
-            results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
+        model = population.population[0]
+        with disable_fp8(model):
+            results = evaluate_core(model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
         wandb_run.log({
             "step": step,
@@ -485,6 +487,13 @@ while True:
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+        for filename in os.listdir(checkpoint_dir):
+            fp = os.path.join(checkpoint_dir, filename)
+            if os.path.isfile(fp):
+                os.remove(fp)
+            elif os.path.isdir(fp):
+                rmtree(fp)
+        print0(f"Cleaned folder {checkpoint_dir}")
         save_population(
             checkpoint_dir,
             step,
