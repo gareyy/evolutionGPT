@@ -36,8 +36,8 @@ class Population:
             model = self.population[i+self.num_strongest]
             model.cross_over(self.population[p[0]], self.population[p[1]])
             model.mutate()
-        for model in self.population[:self.num_strongest]:
-            model.mutate()
+        #for model in self.population[:self.num_strongest]:
+        #    model.mutate(0.001)
 
     def train(self):
         for model in self.population:
@@ -58,3 +58,14 @@ class Population:
     def sort_to_fittest(self, losses: list[float]):
         modeltoloss = dict(zip(self.population, losses))
         self.population.sort(key=lambda m: modeltoloss[m])
+
+    def setup_optimisers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
+        self.optimisers = {}
+        for model in self.population:
+            self.optimisers[model] = model.setup_optimizer(
+                        unembedding_lr, embedding_lr, matrix_lr, weight_decay, scalar_lr
+                    )
+
+    def zero_grad(self, set_to_none: bool):
+        for model in self.population:
+            model.zero_grad(set_to_none)

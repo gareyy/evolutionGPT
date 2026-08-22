@@ -46,7 +46,7 @@ parser.add_argument("--num-iterations", type=int, default=-1, help="explicit num
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
 parser.add_argument("--target-param-data-ratio", type=float, default=12, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
 # Evolution
-parser.add_argument("--num-next-gen", type=int, default=5, help="number of models that will advance to the next generation")
+parser.add_argument("--num-next-gen", type=int, default=3, help="number of models that will advance to the next generation")
 # Optimization
 parser.add_argument("--device-batch-size", type=int, default=8, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
@@ -301,16 +301,14 @@ if weight_decay_scaled != args.weight_decay:
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
-for model in population.population:
-    optimizer = model.setup_optimizer(
+population.setup_optimisers(
         # AdamW hyperparameters
         unembedding_lr=args.unembedding_lr * batch_lr_scale,
         embedding_lr=args.embedding_lr * batch_lr_scale,
         scalar_lr=args.scalar_lr * batch_lr_scale,
         # Muon hyperparameters
         matrix_lr=args.matrix_lr * batch_lr_scale,
-        weight_decay=weight_decay_scaled,
-    )
+        weight_decay=weight_decay_scaled,)
 
 """
 if resuming:
@@ -419,6 +417,7 @@ grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
+print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
 
 # Go!
 while True:
@@ -427,10 +426,12 @@ while True:
 
     # once in a while: evaluate the val bpb on the best model (all ranks participate)
     """
+
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
-        model.eval()
+        population.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
+        model = population.population[0]
         with disable_fp8(model):
             val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
@@ -442,16 +443,14 @@ while True:
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
         })
-        model.train()
-    """
+        population.train()
 
-    """
     # once in a while: estimate the CORE metric (all ranks participate)
     # use the original uncompiled model because the inputs keep changing shape
     # disable FP8 for evaluation to use BF16 for more consistent/accurate results
     results = {}
     if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
-        model.eval()
+        population.eval()
         with disable_fp8(orig_model):
             results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
@@ -461,7 +460,7 @@ while True:
             "core_metric": results["core_metric"],
             "centered_results": results["centered_results"],
         })
-        model.train()
+        population.train()
     """
 
     # once in a while: sample from the best model (only on master process)
@@ -523,7 +522,6 @@ while True:
     synchronize()
     t0 = time.time()
     train_loss = 100.0
-    grad_accum_steps = 1
     for micro_step in tqdm(range(grad_accum_steps)):
         losses = []
         for model in population.population:
@@ -539,31 +537,31 @@ while True:
         population.breed()
         train_loss = min(losses) # for logging
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+    print0(f"Hash of best model: {hash(tuple(population.population[0].parameters()))}")
 
-    """
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(step)
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
-            group["momentum"] = muon_momentum
-            group["weight_decay"] = muon_weight_decay
-    if scaler is not None:
-        scaler.unscale_(optimizer)
-        # In distributed training, all ranks must agree on whether to skip the step.
-        # Each rank may independently encounter inf/nan gradients, so we all-reduce
-        # the found_inf flag (MAX = if any rank found inf, all ranks skip).
-        if is_ddp_initialized():
-            for v in scaler._found_inf_per_device(optimizer).values():
-                dist.all_reduce(v, op=dist.ReduceOp.MAX)
-        scaler.step(optimizer)
-        scaler.update()
-    else:
-        optimizer.step()
-    model.zero_grad(set_to_none=True)
-    """
+    for optimizer in population.optimisers.values():
+        for group in optimizer.param_groups:
+            group["lr"] = group["initial_lr"] * lrm
+            if group['kind'] == 'muon':
+                group["momentum"] = muon_momentum
+                group["weight_decay"] = muon_weight_decay
+        if scaler is not None:
+            scaler.unscale_(optimizer)
+            # In distributed training, all ranks must agree on whether to skip the step.
+            # Each rank may independently encounter inf/nan gradients, so we all-reduce
+            # the found_inf flag (MAX = if any rank found inf, all ranks skip).
+            if is_ddp_initialized():
+                for v in scaler._found_inf_per_device(optimizer).values():
+                    dist.all_reduce(v, op=dist.ReduceOp.MAX)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+    population.zero_grad(set_to_none=True)
     synchronize()
     t1 = time.time()
     dt = t1 - t0
