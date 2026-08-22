@@ -18,7 +18,6 @@ import wandb
 import torch
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
 from nanochat.loss_eval import evaluate_bpb
 import torch.distributed as dist
 from nanochat.flash_attention import HAS_FA3
@@ -29,7 +28,7 @@ from tasks.common import TaskMixture
 from tasks.gsm8k import GSM8K
 from tasks.mmlu import MMLU
 from tasks.smoltalk import SmolTalk
-from evolution.checkpoint_manager import load_population
+from evolution.checkpoint_manager import load_population_obj, load_optimizer_states, save_population
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -59,9 +58,6 @@ parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR a
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=200, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number of tokens to evaluate val loss on")
-parser.add_argument("--chatcore-every", type=int, default=200, help="evaluate ChatCORE metric every N steps (-1 = disable)")
-parser.add_argument("--chatcore-max-cat", type=int, default=-1, help="max problems per categorical task for ChatCORE")
-parser.add_argument("--chatcore-max-sample", type=int, default=24, help="max problems per generative task for ChatCORE")
 # Data mixture
 parser.add_argument("--mmlu-epochs", type=int, default=3, help="number of epochs of MMLU in training mixture (teaches Multiple Choice)")
 parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epochs of GSM8K in training mixture (teaches Math and Tool Use)")
@@ -92,7 +88,7 @@ if not HAS_FA3:
     print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
 
 # Load the model and tokenizer
-population, tokenizer, meta = load_population("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
+population, tokenizer, meta = load_population_obj("base", device=device_type, phase="train", model_tag=args.model_tag, step=args.model_step)
 
 # Inherit training hyperparameters from pretrained checkpoint (None = inherit, explicit value = override)
 pretrain_user_config = meta.get("user_config", {})
@@ -115,10 +111,11 @@ for name, fallback, source in [
     else:
         print0(f"Using {name}={arg_val}")
 
-orig_model = model
-model = torch.compile(model, dynamic=False)
-depth = model.config.n_layer
-num_flops_per_token = model.estimate_flops()
+population.fill_with_random()
+population.breed()
+population.compile()
+depth = population.population[0].config.n_layer
+num_flops_per_token = population.population[0].estimate_flops()
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
 world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
 assert args.total_batch_size % world_tokens_per_fwdbwd == 0, f"total_batch_size ({args.total_batch_size}) must be a multiple of {world_tokens_per_fwdbwd}."
@@ -130,7 +127,7 @@ token_bytes = get_token_bytes(device=device)
 
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
 # Note that pretraining ramps weight_decay to zero by end of pretraining, so SFT continues with zero
-optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=0.0)
+population.setup_optimisers(unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=0.0)
 
 # Optionally warm-start optimizer from pretrained checkpoint (momentum buffers etc.)
 # Note: load_state_dict overwrites param_group metadata (LRs, betas, etc.) with the
@@ -138,16 +135,20 @@ optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_
 # restore our fresh SFT LRs after loading.
 base_dir = get_base_dir()
 if args.load_optimizer:
-    optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
-    if optimizer_data is not None:
-        base_lrs = [group["lr"] for group in optimizer.param_groups]
-        optimizer.load_state_dict(optimizer_data)
-        del optimizer_data
-        for group, base_lr in zip(optimizer.param_groups, base_lrs):
-            group["lr"] = base_lr
-        print0("Loaded optimizer state from pretrained checkpoint (momentum buffers only, LRs reset)")
-    else:
-        print0("WARNING: optimizer checkpoint not found, starting with fresh optimizer (slightly worse)")
+    optimizer_datas = load_optimizer_states("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
+
+    for i, model in enumerate(population.population[:population.num_strongest]):
+        optimizer_data = optimizer_datas[i]
+        if optimizer_data is not None:
+            optimizer = population.optimisers[model]
+            base_lrs = [group["lr"] for group in optimizer.param_groups]
+            optimizer.load_state_dict(optimizer_data)
+            del optimizer_data
+            for group, base_lr in zip(optimizer.param_groups, base_lrs):
+                group["lr"] = base_lr
+            print0("Loaded optimizer state from pretrained checkpoint (momentum buffers only, LRs reset)")
+        else:
+            print0(f"WARNING: optimizer checkpoint {i} not found, starting with fresh optimizer (slightly fucked)")
 
 # GradScaler for fp16 training (bf16/fp32 don't need it)
 scaler = torch.amp.GradScaler() if COMPUTE_DTYPE == torch.float16 else None
@@ -155,9 +156,10 @@ if scaler is not None:
     print0("GradScaler enabled for fp16 training")
 
 # Override the initial learning rate as a fraction of the base learning rate
-for group in optimizer.param_groups:
-    group["lr"] = group["lr"] * args.init_lr_frac
-    group["initial_lr"] = group["lr"]
+for optimizer in population.optimisers.values():
+    for group in optimizer.param_groups:
+        group["lr"] = group["lr"] * args.init_lr_frac
+        group["initial_lr"] = group["lr"]
 
 # SFT data mixture and DataLoader
 train_tasks = [
@@ -324,6 +326,7 @@ def get_muon_momentum(it):
 # Training loop
 x, y = next(train_loader) # prefetch the very first batch of data
 min_val_bpb = float("inf")
+val_pbp = min_val_bpb
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
@@ -339,7 +342,8 @@ while True:
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if last_step or (args.eval_every > 0 and step % args.eval_every == 0):
-        model.eval()
+        population.eval()
+        model = population.population[0]
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
         val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
@@ -352,52 +356,22 @@ while True:
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
         })
-        model.train()
-
-    # once in a while: estimate the ChatCORE metric (all ranks participate)
-    # use the original uncompiled model because the inputs keep changing shape
-    chatcore_results = {}
-    if args.chatcore_every > 0 and (last_step or (step > 0 and step % args.chatcore_every == 0)):
-        model.eval()
-        engine = Engine(orig_model, tokenizer)
-        all_tasks = ['ARC-Easy', 'ARC-Challenge', 'MMLU', 'GSM8K', 'HumanEval']
-        categorical_tasks = {'ARC-Easy', 'ARC-Challenge', 'MMLU'}
-        baseline_accuracies = {
-            'ARC-Easy': 0.25, 'ARC-Challenge': 0.25, 'MMLU': 0.25,
-            'GSM8K': 0.0, 'HumanEval': 0.0,
-        }
-        task_results = {}
-        for task_name in all_tasks:
-            limit = args.chatcore_max_cat if task_name in categorical_tasks else args.chatcore_max_sample
-            max_problems = None if limit < 0 else limit  # -1 means no limit
-            acc = run_chat_eval(task_name, orig_model, tokenizer, engine,
-                                batch_size=args.device_batch_size, max_problems=max_problems)
-            task_results[task_name] = acc
-            print0(f"  {task_name}: {100*acc:.2f}%")
-        # Compute ChatCORE metrics (mean centered accuracy, ranges from 0=random to 1=perfect)
-        def centered_mean(tasks):
-            return sum((task_results[t] - baseline_accuracies[t]) / (1.0 - baseline_accuracies[t]) for t in tasks) / len(tasks)
-        chatcore = centered_mean(all_tasks)
-        chatcore_cat = centered_mean(categorical_tasks)
-        print0(f"Step {step:05d} | ChatCORE: {chatcore:.4f} | ChatCORE_cat: {chatcore_cat:.4f}")
-        wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "chatcore_metric": chatcore,
-            "chatcore_cat": chatcore_cat,
-            **{f"chatcore/{task_name}": acc for task_name, acc in task_results.items()},
-        })
-        model.train()
+        population.train()
 
     # save checkpoint at the end of the run (all ranks participate so each saves its optimizer shard)
     if last_step:
         output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d12
         checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
-        save_checkpoint(
+        for filename in os.listdir(checkpoint_dir):
+            fp = os.path.join(checkpoint_dir, filename)
+            if os.path.isfile(fp) and fp.endswith(".pt") or fp.endswith(".json"):
+                os.remove(fp)
+        print0(f"Cleaned folder {checkpoint_dir}")
+        model = population.population[0]
+        save_population(
             checkpoint_dir,
             step,
-            orig_model.state_dict(),
-            optimizer.state_dict(),
+            population,
             {
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
@@ -423,33 +397,40 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    train_loss = 67.0
+    losses = [train_loss for _ in population.population]
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
-        train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
-        if scaler is not None:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
+        losses = []
+        for model in population.population:
+            loss = model(x, y)
+            train_loss = loss.detach().item()
+            losses.append(train_loss)
+            loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+        train_loss = min(losses) # for logging
         x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
         progress = max(progress, approx_progress) # only increase progress monotonically
     # step the optimizer
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
-            group["momentum"] = muon_momentum
-    if scaler is not None:
-        scaler.unscale_(optimizer)
-        if is_ddp_initialized():
-            for v in scaler._found_inf_per_device(optimizer).values():
-                dist.all_reduce(v, op=dist.ReduceOp.MAX)
-        scaler.step(optimizer)
-        scaler.update()
-    else:
-        optimizer.step()
-    model.zero_grad(set_to_none=True)
+    for optimizer in population.optimisers.values():
+        for group in optimizer.param_groups:
+            group["lr"] = group["initial_lr"] * lrm
+            if group['kind'] == 'muon':
+                group["momentum"] = muon_momentum
+        if scaler is not None:
+            scaler.unscale_(optimizer)
+            if is_ddp_initialized():
+                for v in scaler._found_inf_per_device(optimizer).values():
+                    dist.all_reduce(v, op=dist.ReduceOp.MAX)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+    population.zero_grad(set_to_none=True)
     synchronize()
     t1 = time.time()
     dt = t1 - t0
@@ -459,7 +440,7 @@ while True:
     step += 1
 
     # logging
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss
+    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
     pct_done = 100 * progress
     tok_per_sec = int(args.total_batch_size / dt)

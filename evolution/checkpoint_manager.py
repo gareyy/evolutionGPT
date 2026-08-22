@@ -110,6 +110,7 @@ def build_population(checkpoint_dir, step, device, phase):
         _patch_missing_keys(model_data, model_config)
     population = Population(meta_data[NUM_STRONGEST], model_config, device)
     population.load_model_dicts(model_datas, strict=True, assign=True)
+    population.fill_with_random()
     # Put the model in the right training phase / mode
     if phase == "eval":
         population.eval()
@@ -178,7 +179,7 @@ def load_population_obj(source, *args, **kwargs):
     checkpoints_dir = os.path.join(base_dir, model_dir)
     return load_population_from_dir(checkpoints_dir, *args, **kwargs)
 
-def load_optimizer_state(source, device, rank, model_tag=None, step=None):
+def load_optimizer_states(source, device, rank, model_tag=None, step=None):
     """Load just the optimizer shard for a given rank, without re-loading the model."""
     model_dir = {
         "base": "base_checkpoints",
@@ -186,16 +187,22 @@ def load_optimizer_state(source, device, rank, model_tag=None, step=None):
         "rl": "chatrl_checkpoints",
     }[source]
     base_dir = get_base_dir()
-    checkpoints_dir = os.path.join(base_dir, model_dir)
+    checkpoint_dir = os.path.join(base_dir, model_dir)
     if model_tag is None:
-        model_tag = find_largest_model(checkpoints_dir)
-    checkpoint_dir = os.path.join(checkpoints_dir, model_tag)
+        model_tag = find_largest_model(checkpoint_dir)
+    checkpoint_dir = os.path.join(checkpoint_dir, model_tag)
     if step is None:
         step = find_last_step(checkpoint_dir)
-    optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
-    if not os.path.exists(optimizer_path):
-        log0(f"Optimizer checkpoint not found: {optimizer_path}")
-        return None
-    log0(f"Loading optimizer state from {optimizer_path}")
-    optimizer_data = torch.load(optimizer_path, map_location=device)
-    return optimizer_data
+    meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta_data = json.load(f)
+    datas = []
+    for i in range(meta_data[NUM_STRONGEST]):
+        optimizer_path = os.path.join(checkpoint_dir, f"optim_{i}_{step:06d}_rank{rank:d}.pt")
+        if not os.path.exists(optimizer_path):
+            log0(f"Optimizer checkpoint not found: {optimizer_path}")
+            datas.append(None)
+        log0(f"Loading optimizer state from {optimizer_path}")
+        optimizer_data = torch.load(optimizer_path, map_location=device)
+        datas.append(optimizer_data)
+    return datas

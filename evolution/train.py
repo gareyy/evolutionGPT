@@ -465,12 +465,11 @@ while True:
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+        # delete prev save
         for filename in os.listdir(checkpoint_dir):
             fp = os.path.join(checkpoint_dir, filename)
-            if os.path.isfile(fp):
+            if os.path.isfile(fp) and fp.endswith(".pt") or fp.endswith(".json"):
                 os.remove(fp)
-            elif os.path.isdir(fp):
-                rmtree(fp)
         print0(f"Cleaned folder {checkpoint_dir}")
         save_population(
             checkpoint_dir,
