@@ -29,6 +29,7 @@ from tasks.gsm8k import GSM8K
 from tasks.mmlu import MMLU
 from tasks.smoltalk import SmolTalk
 from evolution.checkpoint_manager import load_population_obj, load_optimizer_states, save_population
+from tqdm import tqdm
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -57,10 +58,13 @@ parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of 
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=200, help="evaluate val bpb every N steps (-1 = disable)")
-parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number of tokens to evaluate val loss on")
+parser.add_argument("--eval-tokens", type=int, default=40*16384, help="number of tokens to evaluate val loss on")
 # Data mixture
 parser.add_argument("--mmlu-epochs", type=int, default=3, help="number of epochs of MMLU in training mixture (teaches Multiple Choice)")
 parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epochs of GSM8K in training mixture (teaches Math and Tool Use)")
+# Other
+parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--stop-at", type=int, default=-1, help="stop sft at this iter")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -111,7 +115,6 @@ for name, fallback, source in [
     else:
         print0(f"Using {name}={arg_val}")
 
-population.fill_with_random()
 population.breed()
 population.compile()
 depth = population.population[0].config.n_layer
@@ -339,6 +342,8 @@ while True:
         last_step_tensor = torch.tensor(last_step, dtype=torch.int32, device=device)
         dist.all_reduce(last_step_tensor, op=dist.ReduceOp.MAX)
         last_step = bool(last_step_tensor.item())
+    if args.stop_at != -1 and step == args.stop_at:
+        last_step = True
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if last_step or (args.eval_every > 0 and step % args.eval_every == 0):
@@ -359,9 +364,10 @@ while True:
         population.train()
 
     # save checkpoint at the end of the run (all ranks participate so each saves its optimizer shard)
-    if last_step:
+    if last_step or (step > 0 and args.save_every > 0 and step % args.save_every == 0):
         output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d12
         checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
+        os.makedirs(checkpoint_dir, exist_ok=True)
         for filename in os.listdir(checkpoint_dir):
             fp = os.path.join(checkpoint_dir, filename)
             if os.path.isfile(fp) and fp.endswith(".pt") or fp.endswith(".json"):
@@ -399,21 +405,21 @@ while True:
     t0 = time.time()
     train_loss = 67.0
     losses = [train_loss for _ in population.population]
-    for micro_step in range(grad_accum_steps):
+    population.train()
+    for micro_step in tqdm(range(grad_accum_steps)):
         losses = []
         for model in population.population:
             loss = model(x, y)
-            train_loss = loss.detach().item()
-            losses.append(train_loss)
+            losses.append(loss.detach().item())
             loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
             if scaler is not None:
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
-        train_loss = min(losses) # for logging
         x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
         progress = max(progress, approx_progress) # only increase progress monotonically
     # step the optimizer
+    train_loss = min(losses) # for logging
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
     for optimizer in population.optimisers.values():
@@ -432,6 +438,8 @@ while True:
             optimizer.step()
     population.zero_grad(set_to_none=True)
     synchronize()
+    population.sort_to_fittest(losses)
+    population.breed()
     t1 = time.time()
     dt = t1 - t0
     # -------------------------------------------------------------------------
@@ -448,7 +456,7 @@ while True:
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
-    print0(f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {current_epoch} | total time: {total_training_time/60:.2f}m")
+    print0(f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {current_epoch} | progress: {approx_progress * 100:.3f} | total time: {total_training_time/60:.2f}m")
     if step % 10 == 0:
         wandb_run.log({
             "step": step,

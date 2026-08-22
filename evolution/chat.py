@@ -12,7 +12,7 @@ from evolution.checkpoint_manager import load_population_obj
 from copy import deepcopy
 
 parser = argparse.ArgumentParser(description='Chat with the model')
-parser.add_argument('-i', '--source', type=str, default="base", help="Source of the model: sft|rl")
+parser.add_argument('-i', '--source', type=str, default="sft", help="Source of the model: sft|rl")
 parser.add_argument('-g', '--model-tag', type=str, default=None, help='Model tag to load')
 parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
 parser.add_argument('-c', '--critter', type=int, default=0, help='Index of critter to load in population')
@@ -38,7 +38,7 @@ model_copy.to(device_type)
 for i, model in enumerate(population.population):
     if i == args.critter:
         continue
-    if population.optimisers != None:
+    if population.optimisers != None and model in population.optimisers.keys():
         del population.optimisers[model]
     del model
 

@@ -92,7 +92,7 @@ def build_population(checkpoint_dir, step, device, phase):
     """
     assert phase in ["train", "eval"], f"Invalid phase: {phase}"
     model_datas, _, meta_data = load_population(checkpoint_dir, step, device, load_optimizer=False)
-    if device.type in {"cpu", "mps"}:
+    if device in {"cpu", "mps"}:
         # Convert bfloat16 tensors to float for CPU inference
         for model_data in model_datas:
             model_data = {
