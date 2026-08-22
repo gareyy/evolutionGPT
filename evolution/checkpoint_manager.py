@@ -12,6 +12,7 @@ from nanochat.common import get_base_dir
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.tokenizer import get_tokenizer
 from nanochat.common import setup_default_logging
+from nanochat.checkpoint_manager import load_checkpoint
 
 # Set up logging
 setup_default_logging()
@@ -79,7 +80,7 @@ def load_population(checkpoint_dir, step, device, num_strongest, load_optimizer=
             optimiser_datas.append(optimiser_data)
     return model_dicts, optimiser_datas, meta_data
 
-def build_model_from_index(checkpoint_dir, step, device, phase):
+def build_model(checkpoint_dir, step, device, phase):
     """
     A bunch of repetitive code to build a model from a given checkpoint.
     Returns:
@@ -88,7 +89,7 @@ def build_model_from_index(checkpoint_dir, step, device, phase):
     - meta data saved during base model training
     """
     assert phase in ["train", "eval"], f"Invalid phase: {phase}"
-    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, step, device, load_optimizer=False)
+    model_data, _, meta_data = load_checkpoint(checkpoint_dir, step, device, load_optimizer=False)
     if device.type in {"cpu", "mps"}:
         # Convert bfloat16 tensors to float for CPU inference
         model_data = {
