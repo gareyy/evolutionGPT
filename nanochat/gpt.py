@@ -576,5 +576,5 @@ class GPT(nn.Module):
             mutation_rate = self.config.mutation_rate if mutation_rate == None else mutation_rate
             if not "weight" in name:
                 continue
-            if torch.rand(1).item() < mutation_rate or True:
+            if torch.rand(1).item() < mutation_rate:
                 param += torch.randn_like(param) * self.config.mutation_stdev

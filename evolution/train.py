@@ -1,5 +1,7 @@
 import os
 
+from torch.autograd import grad
+
 from evolution.population import Population
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import gc
@@ -61,7 +63,7 @@ parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR 
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
-parser.add_argument("--eval-tokens", type=int, default=524288, help="number of tokens to evaluate val loss on")
+parser.add_argument("--eval-tokens", type=int, default=65536, help="number of tokens to evaluate val loss on")
 parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
@@ -536,11 +538,6 @@ while True:
                 loss.backward()
         train_loss = min(losses) # for logging
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-    print0(f"Hashes of top {args.num_next_gen} models: {[hash(model) for model in population.population[:args.num_next_gen]]}")
-    population.sort_to_fittest(losses)
-    population.breed()
-    sortedlosses = sorted(losses)
-    print0(f"Loss of child nodes: {sortedlosses[args.num_next_gen]}")
 
     # step the optimizer
     lrm = get_lr_multiplier(step)
@@ -566,6 +563,11 @@ while True:
             optimizer.step()
     population.zero_grad(set_to_none=True)
     synchronize()
+    population.sort_to_fittest(losses)
+    print0(f"Hashes of top {args.num_next_gen} models: {[hash(model) for model in population.population[:args.num_next_gen]]}")
+    sortedlosses = sorted(losses)
+    print0(f"Loss of child models: {sortedlosses[args.num_next_gen]}")
+    population.breed()
     t1 = time.time()
     dt = t1 - t0
     # -------------------------------------------------------------------------
