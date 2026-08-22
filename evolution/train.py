@@ -148,7 +148,7 @@ optimiser_datas = {}
 meta_data = {}
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
-    model_dicts, optimiser_datas, meta_data = load_population(checkpoint_dir, args.resume_from_step, device, args.num_next_gen, load_optimizer=True, rank=ddp_rank)
+    model_dicts, optimiser_datas, meta_data = load_population(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     population.load_model_dicts(model_dicts, strict=True, assign=True)
     population.breed()
     del model_dicts # free up this memory after the copy
@@ -491,7 +491,6 @@ while True:
                     "total_training_time": total_training_time,
                 },
             },
-            args.num_next_gen,
             rank=ddp_rank,
                 )
 
