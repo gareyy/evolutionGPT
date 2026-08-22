@@ -36,6 +36,8 @@ class Population:
             model = self.population[i+self.num_strongest]
             model.cross_over(self.population[p[0]], self.population[p[1]])
             model.mutate()
+        for model in self.population[:self.num_strongest]:
+            model.mutate()
 
     def train(self):
         for model in self.population:

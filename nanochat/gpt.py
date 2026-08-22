@@ -562,6 +562,8 @@ class GPT(nn.Module):
         modelBparams = modelB.state_dict()
         with torch.no_grad():
             for name, param in self.state_dict().items():
+                if not "weight" in name:
+                    continue
                 if (len(param.shape) == 1):
                     for j in range(len(param)):
                         if torch.rand(1).item() < 0.5:
