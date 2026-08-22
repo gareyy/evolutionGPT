@@ -134,6 +134,7 @@ def get_config(depth):
     return config
 
 config = get_config(args.depth)
+model_config_kwargs = asdict(config)
 population = Population(args.num_next_gen, config, device)
 population.fill_with_random()
 
@@ -149,6 +150,7 @@ if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_dicts, optimiser_datas, meta_data = load_population(checkpoint_dir, args.resume_from_step, device, args.num_next_gen, load_optimizer=True, rank=ddp_rank)
     population.load_model_dicts(model_dicts, strict=True, assign=True)
+    population.breed()
     del model_dicts # free up this memory after the copy
 
 # -----------------------------------------------------------------------------
@@ -521,7 +523,7 @@ while True:
         losses = []
         for model in population.population:
             loss = model(x, y)
-            train_loss = loss.detach()
+            train_loss = loss.detach().item()
             losses.append(train_loss)
             loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
             if scaler is not None:
@@ -567,6 +569,7 @@ while True:
     # logging (CPU action only)
     ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss # EMA the training loss
+    smooth_train_loss = smooth_train_loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(total_batch_size / dt)
