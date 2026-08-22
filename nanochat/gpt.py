@@ -568,7 +568,12 @@ class GPT(nn.Module):
                 #    param = modelAparams[name].detach().clone()
                 #else:
                 #    param = modelBparams[name].detach().clone()
-                self.state_dict()[name].copy_((modelAparams[name].detach().clone() + modelBparams[name].detach().clone()) / 2)
+                alpha = torch.rand(1).item()
+                self.state_dict()[name].copy_(
+                        (
+                            alpha * modelAparams[name].detach().clone() + (1-alpha)*modelBparams[name].detach().clone()
+                            )
+                    )
 
             
     def mutate(self, mutation_rate: float | None = None):
