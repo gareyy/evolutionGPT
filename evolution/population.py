@@ -35,10 +35,11 @@ class Population:
     def breed(self):
         for i, p in enumerate(combinations(range(self.num_strongest), 2)):
             model = self.population[i+self.num_strongest]
+            a = list(model.parameters())[7]
+            print(a)
             model.cross_over(self.population[p[0]], self.population[p[1]])
-            model.mutate()
-        #for model in self.population[:self.num_strongest]:
-        #    model.mutate(0.001)
+            a = list(model.parameters())[7]
+            print(a)
 
     def train(self):
         for model in self.population:

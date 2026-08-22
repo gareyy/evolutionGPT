@@ -568,7 +568,7 @@ class GPT(nn.Module):
                 #    param = modelAparams[name].detach().clone()
                 #else:
                 #    param = modelBparams[name].detach().clone()
-                param = (modelAparams[name] + modelBparams[name]) // 2
+                self.state_dict()[name].copy_((modelAparams[name].detach().clone() + modelBparams[name].detach().clone()) / 2)
 
             
     def mutate(self, mutation_rate: float | None = None):
