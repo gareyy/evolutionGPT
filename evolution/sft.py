@@ -57,7 +57,7 @@ parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of it
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
 # Evaluation
-parser.add_argument("--eval-every", type=int, default=200, help="evaluate val bpb every N steps (-1 = disable)")
+parser.add_argument("--eval-every", type=int, default=10, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=40*16384, help="number of tokens to evaluate val loss on")
 # Data mixture
 parser.add_argument("--mmlu-epochs", type=int, default=3, help="number of epochs of MMLU in training mixture (teaches Multiple Choice)")
@@ -410,16 +410,18 @@ while True:
         losses = []
         for model in population.population:
             loss = model(x, y)
-            losses.append(loss.detach().item())
+            train_loss = loss.item()
+            losses.append(train_loss)
             loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
             if scaler is not None:
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
+        train_loss = min(losses) # for logging
         x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
         progress = max(progress, approx_progress) # only increase progress monotonically
+    print0(f"Average loss: {sum(losses)/len(losses):.6f}, Worst: {max(losses)}, Best: {min(losses)}")
     # step the optimizer
-    train_loss = min(losses) # for logging
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
     for optimizer in population.optimisers.values():
@@ -456,6 +458,7 @@ while True:
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
+    #print0(f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {current_epoch} | progress: {approx_progress * 100:.3f} | total time: {total_training_time/60:.2f}m")
     print0(f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {current_epoch} | progress: {approx_progress * 100:.3f} | total time: {total_training_time/60:.2f}m")
     if step % 10 == 0:
         wandb_run.log({
