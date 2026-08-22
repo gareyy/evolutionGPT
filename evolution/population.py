@@ -18,6 +18,7 @@ class Population:
         self.population: list[GPT] = []
         self.gptconfig = gptconfig
         self.device = device
+        self.optimisers = None
         for _ in range(self.num_strongest):
             model = initialise_model(self.gptconfig, self.device)
             self.population.append(model)
@@ -69,3 +70,14 @@ class Population:
     def zero_grad(self, set_to_none: bool):
         for model in self.population:
             model.zero_grad(set_to_none)
+
+    def load_model_dicts(self, model_dicts, strict=True, assign=True):
+        assert len(model_dicts) == self.num_strongest
+        for i, d in enumerate(model_dicts):
+            self.population[i].load_state_dict(d, strict, assign)
+
+    def load_optimiser_dicts(self, optimiser_data):
+        assert self.optimisers != None and len(optimiser_data) == self.num_strongest
+        for i, d in enumerate(optimiser_data):
+            model = self.population[i]
+            self.optimisers[model].load_state_dict(d)

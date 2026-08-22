@@ -2,6 +2,7 @@ LICENSE
 README.md
 pyproject.toml
 dev/repackage_data_reference.py
+evolution/__init__.py
 evolution/population.py
 evolution/train.py
 evolutionGPT.egg-info/PKG-INFO

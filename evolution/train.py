@@ -2,6 +2,7 @@ import os
 
 from torch.autograd import grad
 
+from evolution.checkpoint_manager import load_population, save_population
 from evolution.population import Population
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import gc
@@ -38,10 +39,10 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
 # Model architecture
-parser.add_argument("--depth", type=int, default=5, help="depth of the Transformer model")
+parser.add_argument("--depth", type=int, default=6, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=32, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=64, help="target head dimension for attention")
-parser.add_argument("--max-seq-len", type=int, default=512, help="max context length")
+parser.add_argument("--max-seq-len", type=int, default=1024, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
@@ -90,7 +91,7 @@ print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="evolutionGPT", name=args.run, config=user_config)
 
 # Flash Attention status
 from nanochat.flash_attention import USE_FA3
@@ -139,18 +140,16 @@ population.fill_with_random()
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
-#  TODO: work on later
-"""
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
+optimiser_datas = {}
+meta_data = {}
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
-    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
-    model.load_state_dict(model_data, strict=True, assign=True)
-    del model_data # free up this memory after the copy
-"""
-resuming = False
+    model_dicts, optimiser_datas, meta_data = load_population(checkpoint_dir, args.resume_from_step, device, args.num_next_gen, load_optimizer=True, rank=ddp_rank)
+    population.load_model_dicts(model_dicts, strict=True, assign=True)
+    del model_dicts # free up this memory after the copy
 
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
@@ -237,7 +236,7 @@ def disable_fp8(model):
 # -----------------------------------------------------------------------------
 # Compile the model
 
-orig_model = population.population[0] # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
+#orig_model = population.population[0] # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
 population.compile() # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
@@ -312,11 +311,11 @@ population.setup_optimisers(
         matrix_lr=args.matrix_lr * batch_lr_scale,
         weight_decay=weight_decay_scaled,)
 
-"""
 if resuming:
-    optimizer.load_state_dict(optimizer_data)
-    del optimizer_data
-"""
+    assert len(optimiser_datas) > 0
+    population.load_optimiser_dicts(optimiser_datas)
+    del optimiser_datas
+
 # -----------------------------------------------------------------------------
 # GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)
 scaler = torch.amp.GradScaler() if COMPUTE_DTYPE == torch.float16 else None
@@ -325,7 +324,8 @@ if scaler is not None:
 
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
-#dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
+
+dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
 dataloader_resume_state_dict = None
 train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
@@ -388,8 +388,6 @@ def get_weight_decay(it):
 # Training loop
 
 # Loop state (variables updated by the training loop)
-# TODO
-"""
 if not resuming:
     step = 0
     val_bpb = None # will be set if eval_every > 0
@@ -404,12 +402,6 @@ else:
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
-"""
-step = 0
-val_bpb = None # will be set if eval_every > 0
-min_val_bpb = float("inf")
-smooth_train_loss = 0 # EMA of training loss
-total_training_time = 0 # total wall-clock time of training
 
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
@@ -468,8 +460,8 @@ while True:
     # once in a while: sample from the best model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
     if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
+        population.eval()
         model = population.population[0]
-        model.eval()
         prompts = [
             "The capital of France is",
             "The chemical symbol of gold is",
@@ -478,23 +470,23 @@ while True:
             "The planets of the solar system are:",
             "My favorite color is",
             "If 5*x + 3 = 13, then x is",
+            "Yo mama so fat",
         ]
-        engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
+        #engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
+        engine = Engine(model, tokenizer) # fuck you lets recompile
         for prompt in prompts:
             tokens = tokenizer(prompt, prepend="<|bos|>")
-            with disable_fp8(orig_model):
+            with disable_fp8(model):
                 sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
             print0(tokenizer.decode(sample[0]))
-        model.train()
+        population.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
-    """
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
-        save_checkpoint(
+        save_population(
             checkpoint_dir,
             step,
-            orig_model.state_dict(), # model parameters
-            optimizer.state_dict(), # optimizer state
+            population,
             { # metadata saved as json
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
@@ -510,9 +502,9 @@ while True:
                     "total_training_time": total_training_time,
                 },
             },
+            args.num_next_gen,
             rank=ddp_rank,
-        )
-    """
+                )
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step:
@@ -564,10 +556,10 @@ while True:
     population.zero_grad(set_to_none=True)
     synchronize()
     population.sort_to_fittest(losses)
-    print0(f"Hashes of top {args.num_next_gen} models: {[hash(model) for model in population.population[:args.num_next_gen]]}")
-    sortedlosses = sorted(losses)
-    print0(f"Loss of child models: {sortedlosses[args.num_next_gen]}")
     population.breed()
+    mean_losses = sum(losses)/len(losses)
+    print0(f"Mean model loss: {mean_losses:.5f}, Best loss: {min(losses):.5f}, Worst loss: {max(losses):.5f}")
+
     t1 = time.time()
     dt = t1 - t0
     # -------------------------------------------------------------------------
@@ -603,6 +595,7 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": epoch,
+            "train/averageloss": mean_losses,
         }
         wandb_run.log(log_data)
 
@@ -613,14 +606,12 @@ while True:
     # The garbage collector is sadly a little bit overactive and for some poorly understood reason,
     # it spends ~500ms scanning for cycles quite frequently, just to end up cleaning up very few tiny objects each time.
     # So we manually manage and help it out here
-    """
     if first_step_of_run:
         gc.collect() # manually collect a lot of garbage from setup
         gc.freeze() # immediately freeze all currently surviving objects and exclude them from GC
         gc.disable() # nuclear intervention here: disable GC entirely except:
     elif step % 5000 == 0: # every 5000 steps...
         gc.collect() # manually collect, just to be safe for very, very long runs
-    """
 
 # print0 a few more stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")

@@ -13,6 +13,7 @@ Requires-Dist: pyarrow>=21.0.0
 Requires-Dist: rustbpe>=0.1.0
 Requires-Dist: tiktoken>=0.11.0
 Requires-Dist: torch==2.9.1
+Requires-Dist: tqdm>=4.67.1
 Requires-Dist: wandb>=0.21.3
 Provides-Extra: cpu
 Requires-Dist: setuptools>=65.0.0; extra == "cpu"
