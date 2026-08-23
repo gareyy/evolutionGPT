@@ -14,8 +14,8 @@ from copy import deepcopy
 parser = argparse.ArgumentParser(description='Chat with the model')
 parser.add_argument('-i', '--source', type=str, default="sft", help="Source of the model: sft|rl")
 parser.add_argument('-g', '--model-tag', type=str, default=None, help='Model tag to load')
-parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
-parser.add_argument('-c', '--critter', type=int, default=0, help='Index of critter to load in population')
+parser.add_argument('-s', '--step', type=int, default=40, help='Step to load')
+parser.add_argument('-c', '--critter', type=int, default=3, help='Index of critter to load in population')
 parser.add_argument('-p', '--prompt', type=str, default='', help='Prompt the model, get a single response back')
 parser.add_argument('-t', '--temperature', type=float, default=0.7, help='Temperature for generation')
 parser.add_argument('-k', '--top-k', type=int, default=100, help='Top-k sampling parameter')
@@ -63,6 +63,7 @@ print("Type 'clear' to start a new conversation")
 print("-" * 50)
 
 conversation_tokens = [bos]
+prev_token = None
 
 while True:
 
