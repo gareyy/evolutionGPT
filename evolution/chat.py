@@ -17,9 +17,10 @@ parser.add_argument('-g', '--model-tag', type=str, default=None, help='Model tag
 parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
 parser.add_argument('-c', '--critter', type=int, default=0, help='Index of critter to load in population')
 parser.add_argument('-p', '--prompt', type=str, default='', help='Prompt the model, get a single response back')
-parser.add_argument('-t', '--temperature', type=float, default=0.6, help='Temperature for generation')
-parser.add_argument('-k', '--top-k', type=int, default=50, help='Top-k sampling parameter')
+parser.add_argument('-t', '--temperature', type=float, default=0.7, help='Temperature for generation')
+parser.add_argument('-k', '--top-k', type=int, default=100, help='Top-k sampling parameter')
 parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
+parser.add_argument('--clear-every-time', action="store_true", help='Clear model context after every prompt')
 args = parser.parse_args()
 
 # Init the model and tokenizer
@@ -119,3 +120,7 @@ while True:
     # In the prompt mode, we only want a single response and exit
     if args.prompt:
         break
+
+    if args.clear_every_time:
+        conversation_tokens = [bos]
+        continue
