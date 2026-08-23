@@ -21,7 +21,18 @@ parser.add_argument('-t', '--temperature', type=float, default=0.7, help='Temper
 parser.add_argument('-k', '--top-k', type=int, default=100, help='Top-k sampling parameter')
 parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
 parser.add_argument('--clear-every-time', action="store_true", help='Clear model context after every prompt')
+parser.add_argument('--sft', action="store_true", help='Use SFT model')
+parser.add_argument('--base', action="store_true", help='Use Base model')
+
 args = parser.parse_args()
+assert not (args.sft and args.base)
+if args.sft:
+    args.source = "sft"
+    args.step = 40
+
+if args.base:
+    args.source = "base"
+    args.step = 409
 
 # Init the model and tokenizer
 
